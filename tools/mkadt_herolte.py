@@ -140,7 +140,6 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3):
     # never shows (Safari's pages and the stock wallpapers black, boot-0317).
     set_prop(child(root, 'product'), 'artwork-display-gamut', mkadt.cstr('sRGB'))
     add_haptics(root)
-    add_bluetooth_isp(root)
     cpus = child(root, 'cpus')
     cpu0 = child(cpus, 'cpu0')
     # S-Boot starts on the Cortex-A53 "Apollo" cluster: MPIDR 0x100..0x103
@@ -206,7 +205,9 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), scale=3):
         ('device_type', mkadt.cstr('wlan')),
         ('compatible', mkadt.cstr('herolte,bcm4359')),
     ]))
-    root.children = [n for n in root.children if n.prop('name') not in
+    # After /arm-io is rebuilt above (it keeps only wdt), or the nodes are lost.
+    add_bluetooth_isp(root)
+    root.children =[n for n in root.children if n.prop('name') not in
                      (mkadt.cstr('sweet-fbcon'), mkadt.cstr('sweet-ufs'))]
     # Exynos 8890 UFSHCI (exynos8890.dtsi ufs@0x155A0000): standard HCI at
     # +0, vendor HCI +0x100, UNIPRO +0x1000, UFS protector +0x2000. Absolute
