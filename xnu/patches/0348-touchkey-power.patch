@@ -1,0 +1,82 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2469,6 +2469,48 @@
+ }
+ 
+ /*
++ * (0348, S7) TOUCH_VDD_3.3V, the capacitive keys' supply (a5xelte_keys.c, 0347): S2MPB02 LDO16 (L16CTRL 0x2d),
++ * "regulator-boot-on" in the stock DTB, 3.3 V fixed. Linux switches it on; under iOS nothing does (boot-0346: LDO16
++ * ctrl 0x6c, off) and the key IC never answered. 3.3 V = 600 mV + 108 x 25 mV = 0x6c. Returns 1 if switched on now,
++ * 0 if it was on, -1 if the PMIC does not answer.
++ */
++int herolte_touchkey_power(void);
++int
++herolte_touchkey_power(void)
++{
++	static vm_offset_t pins;
++	if (!nc_i2c) {
++		nc_i2c = ml_io_map(0x13680000u, 0x1000);
++	}
++	if (!pins) {
++		pins = ml_io_map(0x136d0000u, 0x1000);
++	}
++	if (!nc_i2c || !pins) {
++		printf("HEROLTE TOUCHKEY: power: map failed\n");
++		return -1;
++	}
++	uint32_t con = notefe_rd(pins, 0x40);
++	if (((con >> 16) & 0xf) != 2 || ((con >> 20) & 0xf) != 2) {
++		notefe_pin(pins, 0x40, 4, 2, -1, -1);   /* gpd1-4/5: HSI2C9, the S2MPB02's bus, as notefe_cam_probe does */
++		notefe_pin(pins, 0x40, 5, 2, -1, -1);
++	}
++	nc_bus_init();
++	uint8_t l16 = 0, now = 0;
++	if (!nc_read(0x59, 0x2d, &l16, 1)) {
++		printf("HEROLTE TOUCHKEY: power: the S2MPB02 does not answer\n");
++		return -1;
++	}
++	if ((l16 & 0x80) && (l16 & 0x7f) == 0x6c) {
++		printf("HEROLTE TOUCHKEY: power: TOUCH_VDD_3.3V (LDO16) already on (%#x)\n", l16);
++		return 0;
++	}
++	bool ok = nc_pmic_write(0x2d, 0x80 | 0x6c);
++	nc_read(0x59, 0x2d, &now, 1);
++	printf("HEROLTE TOUCHKEY: power: TOUCH_VDD_3.3V (LDO16) %#x -> %#x %s\n", l16, now, ok ? "on" : "FAILED");
++	return ok ? 1 : -1;
++}
++
++/*
+  * Note FE (0444): camera stage 4, read only (kern.notefe_cam=4): what CSIS2 (the front's MIPI receiver, 0x14100000, in
+  * CAM1) needs and how it is found. CMU_TOP ACLK_CAM1_CSIS2_414 (mux 0x2e8, div 0x448, enable 0x8a8); CMU_CAM1
+  * (0x145d0000) the user muxes (BUS_264 0x20c, CSIS2_414 0x214, RXBYTECLKHS0_CSIS2 0x22c) and gates (BUS_264 0x814 bit 3
+diff --git a/bsd/dev/a5xelte_keys.c b/bsd/dev/a5xelte_keys.c
+--- a/bsd/dev/a5xelte_keys.c
++++ b/bsd/dev/a5xelte_keys.c
+@@ -88,6 +88,7 @@
+  * edge, UIKit's "back" in navigation stacks (Settings, Safari, most apps). The light: on at a press, off 3 s later.
+  */
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern int herolte_touchkey_power(void);      /* herolte_gl.c (0348) */
+ #define TK_PINS_PA      0x14cc0000u
+ #define TK_GPE5_CON     0x20u
+ #define TK_GPE5_DAT     0x24u
+@@ -229,8 +230,17 @@
+ 	tk_line(TK_SDA, 1);
+ 	tk_line(TK_SCL, 1);
+ 	tk_stop();
++	/* 0348: its supply first (off under iOS), then Samsung's boot + reset delays (45 + 150 ms) */
++	int powered = herolte_touchkey_power();
++	tk_msleep(powered > 0 ? 200 : 20);
+ 	uint8_t fw = 0, model = 0;
+-	tk_ok = tk_read(0x01, &fw);
++	for (unsigned attempt = 0; attempt < 5 && !tk_ok; attempt++) {
++		tk_ok = tk_read(0x01, &fw);
++		if (!tk_ok) {
++			tk_stop();
++			tk_msleep(100);
++		}
++	}
+ 	if (tk_ok) {
+ 		tk_read(0x14, &model);
+ 	}
