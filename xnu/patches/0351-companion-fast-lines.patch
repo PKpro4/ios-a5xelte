@@ -1,0 +1,60 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2032,10 +2032,37 @@
+ }
+ 
+ static unsigned nc_half_us = 20;      /* 0349: 2 while the rear Companion's firmware goes over (~50 s otherwise ~8 min) */
++/*
++ * (0351) the fast lines for the Companion's firmware: boot-0350 measured 1.8 KB/s (about 60 us a bit) with delay(1)
++ * and three read-modify-writes per change. Here only the bank's CON register is written, from a copy (the DAT bits of
++ * both lines stay 0, so "output" means low), and the half-period is a spin on the 26 MHz counter.
++ */
++static bool nc_fast;
++static uint32_t nc_fast_con;
++
++static void
++nc_spin_ticks(uint64_t ticks)
++{
++	uint64_t end = mach_absolute_time() + ticks;
++	while (mach_absolute_time() < end) {
++	}
++}
+ 
+ static void
+ nc_line(unsigned pin, int high)
+ {
++	if (nc_fast) {
++		uint32_t m = 0xfu << (4 * pin);
++		nc_fast_con = high ? (nc_fast_con & ~m) : ((nc_fast_con & ~m) | (1u << (4 * pin)));
++		notefe_wr(nc_pins, NC_BANK, nc_fast_con);
++		nc_spin_ticks(26);                    /* 1 us */
++		if (high && pin == NC_SCL) {
++			for (unsigned n = 0; n < 100000 && !((notefe_rd(nc_pins, NC_BANK + 4) >> NC_SCL) & 1); n++) {
++				nc_spin_ticks(3);
++			}
++		}
++		return;
++	}
+ 	nc_pin(nc_pins, NC_BANK, pin, high ? 0 : 1, -1, high ? -1 : 0);        /* input (board pull-up) or output low */
+ 	delay(nc_half_us);
+ 	if (high && pin == NC_SCL) {                                          /* clock stretching: wait for SCL high */
+@@ -2382,6 +2409,10 @@
+ 	 */
+ 	uint32_t i = 0, failed = 0, next_report = 32768;
+ 	nc_half_us = 1;
++	/* 0351: fast lines; both DAT bits 0 first (a line is only ever released or driven low) */
++	notefe_wr(nc_pins, NC_BANK + 4, notefe_rd(nc_pins, NC_BANK + 4) & ~((1u << NC_SDA) | (1u << NC_SCL)));
++	nc_fast_con = notefe_rd(nc_pins, NC_BANK);
++	nc_fast = true;
+ 	while (ok && i < len) {
+ 		uint32_t n = MIN(256u, len - i);
+ 		nc_start();
+@@ -2424,6 +2455,7 @@
+ 	nc_comp_w(0x6C00, 0);
+ 	nc_comp_r(0x6C0C, &c0);
+ 	nc_comp_r(0x6C0E, &c1);
++	nc_fast = false;
+ 	nc_half_us = 20;
+ 	/* as Samsung's memcpy of its two little-endian u16: low byte first */
+ 	uint8_t crc[4] = { (uint8_t)c0, (uint8_t)(c0 >> 8), (uint8_t)c1, (uint8_t)(c1 >> 8) };
