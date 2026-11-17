@@ -74,6 +74,25 @@ ci_init(id self, SEL command, id options)
 }
 
 /*
+ * (S7) iOS's CoreImage takes no software renderer for its own contexts: with no Metal device, +[CIContext
+ * contextWithOptions:] goes to +[CIContext(Internal) internalContextWithEAGLContext:options:] whatever the options say,
+ * and CI::GLContext::init calls OpenGL ES through its empty table: pc 0 (boot-0350, the same stack twice). Callers:
+ * MobileIcons' _MI_sharedIconCompositorContext (Settings > Accessibility) and BarcodeSupport's QR check of a
+ * long-pressed image in Safari (CIDetector, +[CIContext _singletonContext]). No such context is made: they get nil, as
+ * on a device with no GPU (an icon may be left plain, the QR check finds nothing).
+ */
+static id
+no_ci_gl_context(id self, SEL command, id eagl, id options)
+{
+   (void)self;
+   (void)command;
+   (void)eagl;
+   (void)options;
+   herodrm_log("%s: no CoreImage OpenGL ES context given", getprogname());
+   return nil;
+}
+
+/*
  * Photos asserts that its data source has one section, and with no library it has none. Only that failure is let by, as a
  * test of what comes after it; every other goes on to the original, with its text already made.
  */
@@ -291,7 +310,12 @@ install(void)
       ci_software_key = *key;
       ci_init_original = (id (*)(id, SEL, id))method_setImplementation(init, (IMP)ci_init);
    }
-   herodrm_log("%s: libheroapp: CoreImage %s", getprogname(), ci_init_original ? "in software" : "as it was");
+   Method ci_gl = class_getClassMethod(objc_getClass("CIContext"), sel_registerName("internalContextWithEAGLContext:options:"));
+   if (ci_gl != NULL) {
+      method_setImplementation(ci_gl, (IMP)no_ci_gl_context);
+   }
+   herodrm_log("%s: libheroapp: CoreImage %s, GL contexts %s", getprogname(), ci_init_original ? "in software" : "as it was",
+               ci_gl != NULL ? "refused" : "as they were");
    Method assertion = class_getInstanceMethod(objc_getClass("NSAssertionHandler"),
       sel_registerName("handleFailureInMethod:object:file:lineNumber:description:"));
    if (assertion != NULL) {
