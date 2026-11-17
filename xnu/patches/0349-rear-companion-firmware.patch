@@ -1,0 +1,226 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -28,6 +28,8 @@
+ #include <machine/machine_routines.h>
+ #include <sys/proc_internal.h>
+ #include <kern/thread.h>
++#include <sys/fcntl.h>                  /* 0349: the Companion's firmware from the drop zone */
++#include <sys/vnode_internal.h>
+ 
+ int herolte_gl_env(const char *path, int pid, const char **extra, int max);
+ uint64_t herolte_gl_dyld_flags(void);
+@@ -1917,7 +1919,7 @@
+ static void notefe_cam_csis_look(void);
+ static void notefe_cam_frame(vm_offset_t pins);
+ static void nc_dev_make(void);
+-static void notefe_cam_rear_id(vm_offset_t pins);
++static void notefe_cam_rear_id(vm_offset_t pins, int level);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1992,8 +1994,8 @@
+ 	if (level == 7) {
+ 		nc_dev_make();
+ 	}
+-	if (level == 9) {
+-		notefe_cam_rear_id(pins);       /* 0346 */
++	if (level == 9 || level == 10) {
++		notefe_cam_rear_id(pins, level);        /* 0346; 10: + the Companion's firmware (0349) */
+ 	}
+ }
+ 
+@@ -2029,11 +2031,13 @@
+ 	}
+ }
+ 
++static unsigned nc_half_us = 20;      /* 0349: 2 while the rear Companion's firmware goes over (~50 s otherwise ~8 min) */
++
+ static void
+ nc_line(unsigned pin, int high)
+ {
+ 	nc_pin(nc_pins, NC_BANK, pin, high ? 0 : 1, -1, high ? -1 : 0);        /* input (board pull-up) or output low */
+-	delay(20);
++	delay(nc_half_us);
+ 	if (high && pin == NC_SCL) {                                          /* clock stretching: wait for SCL high */
+ 		for (unsigned n = 0; n < 1000 && !((notefe_rd(nc_pins, NC_BANK + 4) >> NC_SCL) & 1); n++) {
+ 			delay(1);
+@@ -2291,6 +2295,141 @@
+  * and VDDA_1.8V_CAM (IMX260 only), not needed to answer on I2C. Pins (stock DTB): sensor reset gpc1-0, Companion reset
+  * gpc1-2, MCLK0/1 gpk0-0/1 function 2, ISP I2C0 gpc2-0 SDA / gpc2-1 SCL (bit-banged, as the front's).
+  */
++/*
++ * (0349, S7) the rear Companion (Samsung 73C3, I2C 0x3d) gets its firmware, as Samsung's fimc_is_comp_loadfirm()
++ * (fimc-is-companion_c3.c) does, over I2C instead of SPI: Samsung's single writes have an I2C path (16-bit register,
++ * 16-bit value, high byte first) and its SPI burst only writes the auto-incrementing data port 0x6F12, which I2C
++ * has too (its calibration load: pointer 0x6028/0x602A, then 0x6F12 word by word). Order: 0x0008 = 1 (download),
++ * pointer 0x0008:0000 (RAM at 0x80000), the file's bytes in order (SPI LITTLE_ENDIAN: b[i] then b[i+1]), then the
++ * Companion's own CRC32 over all but the last 4 bytes (0x6C0C seed, 0x6C04 start - 0x80000, 0x6C08 size, 0x6C00 go,
++ * 0x6C14 done, result at 0x6C0C/0x6C0E) against those 4 bytes; only if they match: 0x6048 = 1 (ARM reset + remap),
++ * 0x6014 = 1 (ARM go), and 0x0002 should change from 0x00A0 (no firmware) to 0x10A0/0x10A1. The firmware is the
++ * phone's own (VENDOR companion_fw_imx260.bin) in the private drop zone as cam/c73c3.bin, never in this repo.
++ */
++#define NC_COMP         0x3d
++#define NC_COMP_FW      "/private/var/herolte/cam/c73c3.bin"
++#define NC_COMP_FW_MAX  (512u * 1024u)
++
++static bool
++nc_comp_w(uint16_t reg, uint16_t v)
++{
++	nc_start();
++	bool ok = nc_byte_out((uint8_t)(NC_COMP << 1)) && nc_byte_out((uint8_t)(reg >> 8)) && nc_byte_out((uint8_t)reg) &&
++	    nc_byte_out((uint8_t)(v >> 8)) && nc_byte_out((uint8_t)v);
++	nc_stop();
++	return ok;
++}
++
++static bool
++nc_comp_r(uint16_t reg, uint16_t *v)
++{
++	uint8_t b[2] = { 0, 0 };
++	bool ok = nc_sensor_read(NC_COMP, reg, b, 2);
++	*v = (uint16_t)(b[0] << 8 | b[1]);
++	return ok;
++}
++
++/* the drop zone's copy of the firmware; NULL if absent. *len gets its size. Free with kfree_data(p, NC_COMP_FW_MAX). */
++static uint8_t *
++nc_comp_fw_read(uint32_t *len)
++{
++	vfs_context_t ctx = vfs_context_kernel();
++	vnode_t vp = NULLVP;
++	*len = 0;
++	if (vnode_open(NC_COMP_FW, FREAD, 0, 0, &vp, ctx) != 0) {
++		printf("NOTEFE CAM: rear: no %s in the drop zone\n", NC_COMP_FW);
++		return NULL;
++	}
++	uint8_t *buf = kalloc_data(NC_COMP_FW_MAX, Z_WAITOK | Z_ZERO);
++	int resid = 0;
++	if (buf != NULL && vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)NC_COMP_FW_MAX, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx),
++	    &resid, vfs_context_proc(ctx)) == 0 && resid > 0) {
++		*len = NC_COMP_FW_MAX - (uint32_t)resid;      /* a short read: the whole file (it must be under 512 KiB) */
++	}
++	vnode_close(vp, FREAD, ctx);
++	if (buf != NULL && (*len < 1024 || (*len & 1))) {
++		printf("NOTEFE CAM: rear: %s: %u bytes, not a firmware\n", NC_COMP_FW, *len);
++		kfree_data(buf, NC_COMP_FW_MAX);
++		return NULL;
++	}
++	return buf;
++}
++
++static void
++nc_comp_firmware(void)
++{
++	uint32_t len = 0;
++	uint8_t *fw = nc_comp_fw_read(&len);
++	if (fw == NULL) {
++		return;
++	}
++	char rev[12];
++	memcpy(rev, fw + len - 16, 11);
++	rev[11] = 0;
++	uint16_t sig = 0;
++	nc_comp_r(0x0002, &sig);
++	printf("NOTEFE CAM: rear: Companion firmware %u bytes, version %s, CRC32 %02x%02x%02x%02x; 0x0002 before = %#06x\n",
++	    len, rev, fw[len - 4], fw[len - 3], fw[len - 2], fw[len - 1], sig);
++	uint64_t t0 = mach_absolute_time();
++	nc_half_us = 2;
++	bool ok = nc_comp_w(0x0008, 0x0001);
++	delay(1000);
++	ok = ok && nc_comp_w(0x6028, 0x0008) && nc_comp_w(0x602A, 0x0000);
++	uint32_t i = 0, failed = 0;
++	for (; ok && i < len; i += 2) {
++		if (!nc_comp_w(0x6F12, (uint16_t)(fw[i] << 8 | fw[i + 1]))) {
++			if (++failed > 8) {
++				ok = false;
++			}
++			i -= 2;                 /* the same word again */
++		}
++	}
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("NOTEFE CAM: rear: firmware written: %s, %u of %u bytes, %u retries, %llu ms\n", ok ? "ok" : "FAILED", i, len,
++	    failed, ns / 1000000ull);
++	/* the Companion's own CRC32 over all but the last 4 bytes */
++	uint16_t done = 0, c0 = 0, c1 = 0;
++	uint32_t size = len - 4;
++	ok = ok && nc_comp_w(0x6C0C, 0) && nc_comp_w(0x6C0E, 0) && nc_comp_w(0x6C04, 0) && nc_comp_w(0x6C06, 0) &&
++	    nc_comp_w(0x6C08, (uint16_t)size) && nc_comp_w(0x6C0A, (uint16_t)(size >> 16)) && nc_comp_w(0x6C00, 1);
++	for (unsigned n = 0; ok && n < 1000; n++) {
++		if (nc_comp_r(0x6C14, &done) && done == 1) {
++			break;
++		}
++		delay(1000);
++	}
++	nc_comp_w(0x6C00, 0);
++	nc_comp_r(0x6C0C, &c0);
++	nc_comp_r(0x6C0E, &c1);
++	nc_half_us = 20;
++	/* as Samsung's memcpy of its two little-endian u16: low byte first */
++	uint8_t crc[4] = { (uint8_t)c0, (uint8_t)(c0 >> 8), (uint8_t)c1, (uint8_t)(c1 >> 8) };
++	bool same = done == 1 && memcmp(crc, fw + len - 4, 4) == 0;
++	printf("NOTEFE CAM: rear: Companion CRC32 %s: %02x%02x%02x%02x (file %02x%02x%02x%02x)\n",
++	    done != 1 ? "NOT finished" : same ? "matches" : "DIFFERS", crc[0], crc[1], crc[2], crc[3], fw[len - 4],
++	    fw[len - 3], fw[len - 2], fw[len - 1]);
++	kfree_data(fw, NC_COMP_FW_MAX);
++	if (!same) {
++		printf("NOTEFE CAM: rear: firmware not started\n");
++		return;
++	}
++	nc_comp_w(0x6048, 0x0001);                 /* ARM reset and memory remap */
++	nc_comp_w(0x6014, 0x0001);                 /* ARM go */
++	delay(1000);
++	uint16_t id = 0;
++	for (unsigned n = 0; n < 10; n++) {
++		nc_comp_r(0x0002, &sig);
++		if (sig == 0x10a0 || sig == 0x10a1) {
++			break;
++		}
++		delay(10000);
++	}
++	nc_comp_r(0x0000, &id);
++	printf("NOTEFE CAM: rear: Companion %s: 0x0000 = %#06x, 0x0002 = %#06x\n",
++	    (sig == 0x10a0 || sig == 0x10a1) ? "FIRMWARE RUNS" : "firmware does not answer", id, sig);
++}
++
+ struct nc_rail { const char *name; uint8_t reg; uint8_t code; bool fine; unsigned min_mv, max_mv; unsigned wait_us; };
+ 
+ static unsigned
+@@ -2300,7 +2439,7 @@
+ }
+ 
+ static void
+-notefe_cam_rear_id(vm_offset_t pins)
++notefe_cam_rear_id(vm_offset_t pins, int level)
+ {
+ 	/* Samsung's order; min/max = the stock DTB's constraints, checked before anything is written */
+ 	static const struct nc_rail rails[] = {
+@@ -2410,7 +2549,7 @@
+ 	delay(1000);
+ 	printf("NOTEFE CAM: rear: ISP I2C0 idle: gpc2 dat %#x (SDA gpc2-0 %u, SCL gpc2-1 %u)\n", notefe_rd(pins, 0x144),
+ 	    notefe_rd(pins, 0x144) & 1, (notefe_rd(pins, 0x144) >> 1) & 1);
+-	for (unsigned order = 0; order < 2; order++) {
++	for (unsigned order = 0; order < (level == 10 ? 1u : 2u); order++) {     /* 0349: 10 knows the order (0346) */
+ 		NC_SDA = order ? 1 : 0;
+ 		NC_SCL = order ? 0 : 1;
+ 		nc_scan("the rear camera's bus (ISP I2C0)");
+@@ -2429,6 +2568,9 @@
+ 			}
+ 		}
+ 	}
++	if (level == 10) {
++		nc_comp_firmware();                     /* 0349 */
++	}
+ 	/* down again, the reverse; everything back as found */
+ 	nc_pin(pins, 0x120, 0, 1, 0, 0);            /* sen_rst low */
+ 	nc_pin(pins, 0x120, 2, 1, 0, 0);            /* prep_rst low */
+@@ -3369,7 +3511,7 @@
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || (value > 7 && value != 9)) {     /* 0346: 9 = the rear camera's probe */
++	if (value < 1 || (value > 7 && value != 9 && value != 10)) {     /* 0346: 9 rear probe; 0349: 10 + Companion firmware */
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
