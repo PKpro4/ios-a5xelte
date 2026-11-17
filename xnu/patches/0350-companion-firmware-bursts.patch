@@ -1,0 +1,46 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -2375,13 +2375,35 @@
+ 	bool ok = nc_comp_w(0x0008, 0x0001);
+ 	delay(1000);
+ 	ok = ok && nc_comp_w(0x6028, 0x0008) && nc_comp_w(0x602A, 0x0000);
+-	uint32_t i = 0, failed = 0;
+-	for (; ok && i < len; i += 2) {
+-		if (!nc_comp_w(0x6F12, (uint16_t)(fw[i] << 8 | fw[i + 1]))) {
+-			if (++failed > 8) {
+-				ok = false;
+-			}
+-			i -= 2;                 /* the same word again */
++	/*
++	 * (0350) bursts: 0x6F12 then 256 data bytes in one transaction (as Samsung's sensor drivers write 0x6F12 over
++	 * I2C), not one transaction per word: 0349 had not finished after minutes (boot-0349). The CRC below tells if
++	 * the Companion took them. A failed burst is sent again from the pointer it was at.
++	 */
++	uint32_t i = 0, failed = 0, next_report = 32768;
++	nc_half_us = 1;
++	while (ok && i < len) {
++		uint32_t n = MIN(256u, len - i);
++		nc_start();
++		bool b = nc_byte_out((uint8_t)(NC_COMP << 1)) && nc_byte_out(0x6F) && nc_byte_out(0x12);
++		for (uint32_t k = 0; b && k < n; k++) {
++			b = nc_byte_out(fw[i + k]);
++		}
++		nc_stop();
++		if (b) {
++			i += n;
++		} else if (++failed > 8) {
++			ok = false;
++		} else {
++			/* the pointer moved by an unknown amount: set it again at this burst's start */
++			nc_comp_w(0x6028, (uint16_t)((0x80000u + i) >> 16));
++			nc_comp_w(0x602A, (uint16_t)(0x80000u + i));
++		}
++		if (i >= next_report) {
++			uint64_t t = 0;
++			absolutetime_to_nanoseconds(mach_absolute_time() - t0, &t);
++			printf("NOTEFE CAM: rear: firmware %u of %u bytes, %llu ms\n", i, len, t / 1000000ull);
++			next_report += 32768;
+ 		}
+ 	}
+ 	uint64_t ns = 0;
