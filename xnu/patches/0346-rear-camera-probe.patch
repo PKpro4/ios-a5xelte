@@ -1,0 +1,225 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1917,6 +1917,7 @@
+ static void notefe_cam_csis_look(void);
+ static void notefe_cam_frame(vm_offset_t pins);
+ static void nc_dev_make(void);
++static void notefe_cam_rear_id(vm_offset_t pins);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1991,6 +1992,9 @@
+ 	if (level == 7) {
+ 		nc_dev_make();
+ 	}
++	if (level == 9) {
++		notefe_cam_rear_id(pins);       /* 0346 */
++	}
+ }
+ 
+ /*
+@@ -2277,6 +2281,194 @@
+ }
+ 
+ /*
++ * (0346, S7) the rear camera, read only (kern.notefe_cam=9): power the rear module as Samsung's herolte kernel does
++ * (fimc-is-module-2l1.c / -imx260.c, SENSOR_SCENARIO_NORMAL, GPIO_SCENARIO_ON), scan its I2C and ask the Companion
++ * preprocessor (0x7a, 7-bit 0x3d) and both possible sensors (S5K2L1 0x5a/0x2d, model 0x0000; IMX260 0x34/0x1a, model
++ * 0x0016) who they are, then power everything down and put the pins back as found. No firmware is loaded.
++ * S2MPB02 (drivers/regulator/s2mpb02-regulator.c, s2mpb02-private.h): LnCTRL = 0x1d + n, bit 7 enable, bits 6:0
++ * = 600 mV + n * 12.5 mV (LDO1-5) or 25 mV (LDO6-18); B2CTRL1 0x0d (enable bits 7:6), B2CTRL2 0x0e = 400 mV + 6.25 mV n.
++ * VDDA_2.9V_CAM goes 1.2 V then 2.875 V (IMX260's; the 2L1 takes 2.95 V: the lower one fits both). Not powered: OIS
++ * and VDDA_1.8V_CAM (IMX260 only), not needed to answer on I2C. Pins (stock DTB): sensor reset gpc1-0, Companion reset
++ * gpc1-2, MCLK0/1 gpk0-0/1 function 2, ISP I2C0 gpc2-0 SDA / gpc2-1 SCL (bit-banged, as the front's).
++ */
++struct nc_rail { const char *name; uint8_t reg; uint8_t code; bool fine; unsigned min_mv, max_mv; unsigned wait_us; };
++
++static unsigned
++nc_rail_mv(const struct nc_rail *r)
++{
++	return 600 + (r->fine ? r->code * 25u / 2u : r->code * 25u);
++}
++
++static void
++notefe_cam_rear_id(vm_offset_t pins)
++{
++	/* Samsung's order; min/max = the stock DTB's constraints, checked before anything is written */
++	static const struct nc_rail rails[] = {
++		{ "VDDD_RET_1.0V_COMP (LDO4)",   0x21, 0x24, true,   700, 1050,    0 },
++		{ "VDDAF_2.8V_CAM (LDO12)",      0x29, 0x58, false, 2800, 2800, 2000 },
++		{ "VDDA_2.9V_CAM (LDO11) step",  0x28, 0x18, false, 1000, 2950,    0 },
++		{ "VDDA_2.9V_CAM (LDO11)",       0x28, 0x5b, false, 1000, 2950,    0 },
++		{ "VDDD_1.2V_CAM (LDO3)",        0x20, 0x24, true,  1000, 1200,    0 },
++		{ "VDDIO_1.8V_CAM (LDO7)",       0x24, 0x30, false, 1800, 1800,    0 },
++		{ "VDDA_1.8V_COMP (LDO9)",       0x26, 0x30, false, 1800, 1800,    0 },
++		{ "VDDIO_1.8V_COMP (LDO8)",      0x25, 0x30, false, 1800, 1800,  100 },
++		{ "VDDD_CORE_1.0V_COMP (LDO2)",  0x1f, 0x20, true,  1000, 1000,  100 },
++	};
++	const unsigned nrails = sizeof(rails) / sizeof(rails[0]);
++	const uint8_t b2_code = 0x40;                   /* VDDD_CORE_0.8V_COMP (BUCK2) 0.8 V; DTB 650-850 mV */
++	const struct nc_rail ldo1 = { "VDDD_NORET_0.9V_COMP (LDO1)", 0x1e, 0x1c, true, 950, 950, 100 };
++	for (unsigned i = 0; i < nrails; i++) {
++		unsigned mv = nc_rail_mv(&rails[i]);
++		if (mv < rails[i].min_mv || mv > rails[i].max_mv) {
++			printf("NOTEFE CAM: rear: %s would be %u mV, outside %u-%u: nothing powered\n", rails[i].name, mv,
++			    rails[i].min_mv, rails[i].max_mv);
++			return;
++		}
++	}
++	if (nc_rail_mv(&ldo1) != 950 || 400 + b2_code * 25u / 4u != 800) {
++		printf("NOTEFE CAM: rear: LDO1/BUCK2 codes wrong: nothing powered\n");
++		return;
++	}
++	nc_pins = pins;
++	/* as found: the PMIC's rails and the four pin banks */
++	uint8_t found[0x30];
++	for (unsigned r = 0x0b; r <= 0x2f; r++) {
++		found[r] = 0;
++		if (!nc_read(0x59, (uint8_t)r, &found[r], 1)) {
++			printf("NOTEFE CAM: rear: the S2MPB02 does not answer (reg %#x), nothing powered\n", r);
++			return;
++		}
++	}
++	uint32_t c1_con = notefe_rd(pins, 0x120), c1_dat = notefe_rd(pins, 0x124), c1_pud = notefe_rd(pins, 0x128);
++	uint32_t c2_con = notefe_rd(pins, 0x140), c2_pud = notefe_rd(pins, 0x148), k0_con = notefe_rd(pins, 0x180);
++	printf("NOTEFE CAM: rear: as found: B1 %#x/%#x B2 %#x/%#x BB %#x/%#x; LDO1-4 %#x %#x %#x %#x, LDO7-12 %#x %#x %#x %#x %#x %#x;"
++	    " gpc1 con %#x dat %#x, gpc2 con %#x, gpk0 con %#x\n", found[0x0b], found[0x0c], found[0x0d], found[0x0e], found[0x0f],
++	    found[0x10], found[0x1e], found[0x1f], found[0x20], found[0x21], found[0x24], found[0x25], found[0x26], found[0x27],
++	    found[0x28], found[0x29], c1_con, c1_dat, c2_con, k0_con);
++	/* resets low; BUCK1 (1.3 V) and BB on as the front's stage 3 does (always-on in the DTB, nothing keeps them on here) */
++	nc_pin(pins, 0x120, 0, 1, 0, 0);            /* sen_rst low */
++	nc_pin(pins, 0x120, 2, 1, 0, 0);            /* prep_rst low */
++	bool b1_on = false, bb_on = false;
++	if ((found[0x0b] & 0xc0) != 0xc0) {
++		b1_on = nc_pmic_write(0x0c, 0x90) && nc_pmic_write(0x0b, (uint8_t)(found[0x0b] | 0xc0));
++		delay(200);
++	}
++	if ((found[0x0f] & 0xc0) != 0xc0 && 2600 + (found[0x10] & 0x7f) * 25 / 2 <= 4000) {
++		bb_on = nc_pmic_write(0x0f, (uint8_t)(found[0x0f] | 0xc0));
++		delay(200);
++	}
++	bool ok = true;
++	for (unsigned i = 0; i < nrails && ok; i++) {
++		ok = nc_pmic_write(rails[i].reg, (uint8_t)(0x80 | rails[i].code));
++		if (rails[i].wait_us) {
++			delay(rails[i].wait_us);
++		}
++	}
++	ok = ok && nc_pmic_write(0x0e, b2_code) && nc_pmic_write(0x0d, (uint8_t)(found[0x0d] | 0xc0));
++	delay(100);
++	ok = ok && nc_pmic_write(ldo1.reg, (uint8_t)(0x80 | ldo1.code));
++	delay(100);
++	uint8_t now[0x30];
++	for (unsigned r = 0x0d; r <= 0x2f; r++) {
++		now[r] = 0;
++		nc_read(0x59, (uint8_t)r, &now[r], 1);
++	}
++	printf("NOTEFE CAM: rear: rails %s: B2 %#x/%#x LDO1-4 %#x %#x %#x %#x, LDO7-12 %#x %#x %#x %#x %#x %#x\n",
++	    ok ? "on" : "NOT all on", now[0x0d], now[0x0e], now[0x1e], now[0x1f], now[0x20], now[0x21], now[0x24], now[0x25],
++	    now[0x26], now[0x27], now[0x28], now[0x29]);
++	/* MCLK0 (sensor) and MCLK1 (Companion): TOP sensor clocks 0 and 1 from OSCCLK, undivided (26 MHz), as the front's 2 */
++	static vm_offset_t top;
++	if (!top) {
++		top = ml_io_map(0x10570000u, 0x1000);
++	}
++	uint32_t mux[2] = { 0, 0 }, div[2] = { 0, 0 };
++	for (unsigned n = 0; n < 2 && top; n++) {
++		uint32_t o = 0xb00 + 0x10 * n;
++		mux[n] = notefe_rd(top, o);
++		div[n] = notefe_rd(top, o + 4);
++		notefe_wr(top, o, mux[n] & ~(7u << 12));
++		for (unsigned t = 0; t < 1000 && ((notefe_rd(top, o + 8) >> 12) & 7) != 0; t++) {
++			delay(1);
++		}
++		notefe_wr(top, o + 4, div[n] & ~0xffu);
++		printf("NOTEFE CAM: rear: MCLK%u mux %#x -> %#x (status %#x), divider %#x -> %#x\n", n, mux[n],
++		    notefe_rd(top, o), notefe_rd(top, o + 8), div[n], notefe_rd(top, o + 4));
++	}
++	nc_pin(pins, 0x180, 0, 2, 0, -1);
++	nc_pin(pins, 0x180, 1, 2, 0, -1);
++	delay(2000);
++	nc_pin(pins, 0x120, 2, 1, 0, 1);            /* prep_rst high */
++	delay(300);
++	nc_pin(pins, 0x120, 0, 1, 0, 1);            /* sen_rst high */
++	delay(10000);
++	/* ISP I2C0, bit-banged: released lines first (input, board pull-ups) */
++	NC_BANK = 0x140;
++	NC_SDA = 0;
++	NC_SCL = 1;
++	nc_line(0, 1);
++	nc_line(1, 1);
++	delay(1000);
++	printf("NOTEFE CAM: rear: ISP I2C0 idle: gpc2 dat %#x (SDA gpc2-0 %u, SCL gpc2-1 %u)\n", notefe_rd(pins, 0x144),
++	    notefe_rd(pins, 0x144) & 1, (notefe_rd(pins, 0x144) >> 1) & 1);
++	for (unsigned order = 0; order < 2; order++) {
++		NC_SDA = order ? 1 : 0;
++		NC_SCL = order ? 0 : 1;
++		nc_scan("the rear camera's bus (ISP I2C0)");
++		static const struct { uint8_t addr; uint16_t reg; const char *who; } ask[] = {
++			{ 0x3d, 0x0000, "Companion" }, { 0x3d, 0x0002, "Companion" },
++			{ 0x2d, 0x0000, "S5K2L1 (expect 0x20c1)" }, { 0x2d, 0x0002, "S5K2L1 revision" },
++			{ 0x1a, 0x0016, "IMX260 (expect 0x0260)" }, { 0x1a, 0x0000, "IMX260" },
++		};
++		for (unsigned a = 0; a < sizeof(ask) / sizeof(ask[0]); a++) {
++			uint8_t v[2] = { 0, 0 };
++			if (nc_sensor_read(ask[a].addr, ask[a].reg, v, 2)) {
++				printf("NOTEFE CAM: rear: %#x (%s) reg %#06x = %#06x\n", ask[a].addr, ask[a].who, ask[a].reg,
++				    v[0] << 8 | v[1]);
++			} else {
++				printf("NOTEFE CAM: rear: %#x (%s) reg %#06x: no answer\n", ask[a].addr, ask[a].who, ask[a].reg);
++			}
++		}
++	}
++	/* down again, the reverse; everything back as found */
++	nc_pin(pins, 0x120, 0, 1, 0, 0);            /* sen_rst low */
++	nc_pin(pins, 0x120, 2, 1, 0, 0);            /* prep_rst low */
++	delay(10);
++	nc_pin(pins, 0x180, 0, 0, -1, -1);
++	nc_pin(pins, 0x180, 1, 0, -1, -1);
++	for (unsigned n = 0; n < 2 && top; n++) {
++		notefe_wr(top, 0xb04 + 0x10 * n, div[n]);
++		notefe_wr(top, 0xb00 + 0x10 * n, mux[n]);
++	}
++	nc_pmic_write(ldo1.reg, found[ldo1.reg]);
++	nc_pmic_write(0x0d, found[0x0d]);
++	nc_pmic_write(0x0e, found[0x0e]);
++	for (unsigned i = nrails; i-- > 0;) {
++		nc_pmic_write(rails[i].reg, found[rails[i].reg]);
++	}
++	if (bb_on) {
++		nc_pmic_write(0x0f, found[0x0f]);
++	}
++	if (b1_on) {
++		nc_pmic_write(0x0b, found[0x0b]);
++		nc_pmic_write(0x0c, found[0x0c]);
++	}
++	notefe_wr(pins, 0x140, c2_con);
++	notefe_wr(pins, 0x148, c2_pud);
++	notefe_wr(pins, 0x180, k0_con);
++	notefe_wr(pins, 0x124, c1_dat);
++	notefe_wr(pins, 0x128, c1_pud);
++	notefe_wr(pins, 0x120, c1_con);
++	NC_BANK = 0x140;
++	NC_SDA = 2;
++	NC_SCL = 3;
++	uint8_t l2 = 0, l11 = 0, b2 = 0;
++	nc_read(0x59, 0x1f, &l2, 1);
++	nc_read(0x59, 0x28, &l11, 1);
++	nc_read(0x59, 0x0d, &b2, 1);
++	printf("NOTEFE CAM: rear: powered down: LDO2 %#x LDO11 %#x B2 %#x; pins back as found\n", l2, l11, b2);
++}
++
++/*
+  * Note FE (0444): camera stage 4, read only (kern.notefe_cam=4): what CSIS2 (the front's MIPI receiver, 0x14100000, in
+  * CAM1) needs and how it is found. CMU_TOP ACLK_CAM1_CSIS2_414 (mux 0x2e8, div 0x448, enable 0x8a8); CMU_CAM1
+  * (0x145d0000) the user muxes (BUS_264 0x20c, CSIS2_414 0x214, RXBYTECLKHS0_CSIS2 0x22c) and gates (BUS_264 0x814 bit 3
+@@ -3135,7 +3327,7 @@
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value > 7) {
++	if (value < 1 || (value > 7 && value != 9)) {     /* 0346: 9 = the rear camera's probe */
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
