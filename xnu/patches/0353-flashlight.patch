@@ -1,0 +1,124 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1920,6 +1920,7 @@
+ static void notefe_cam_frame(vm_offset_t pins);
+ static void nc_dev_make(void);
+ static void notefe_cam_rear_id(vm_offset_t pins, int level);
++static void nc_torch_make(void);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1993,6 +1994,7 @@
+ 	}
+ 	if (level == 7) {
+ 		nc_dev_make();
++		nc_torch_make();                /* 0353: the flashlight */
+ 	}
+ 	if (level >= 9 && level <= 11) {
+ 		notefe_cam_rear_id(pins, level);        /* 0346; 10: + the Companion's firmware (0349); 11: + IMX260 stream (0352) */
+@@ -3642,6 +3644,104 @@
+ 	printf("NOTEFE CAM: /dev/hakios-camera made (major %d)\n", major);
+ }
+ 
++/*
++ * (0353, S7) the flashlight: /dev/hakios-torch takes a u32, 0-1000 thousandths, from gpu/camera's torch_set() (the
++ * back camera's TorchLevel, what Control Center's flashlight sets). The rear LED is the S2MPB02's flash LED driver
++ * (Samsung's drivers/leds/leds-s2mpb02.c, stock DTB torch-sec1): FLED_CUR1 0x14 low nibble = torch current in 20 mA
++ * steps (Samsung's own torch levels 1-10 = 20-200 mA are used, 1000 = 200 mA), FLED_TIME1 0x15 low nibble = the DTB's
++ * torch timeout 0xf, FLED_CTRL1 0x12: bit 3 low-voltage mode off, bits 7:6 = 11 on (enable, torch mode), 00 off.
++ */
++static void
++nc_torch_set(uint32_t thousandths)
++{
++	static vm_offset_t pins;
++	if (!nc_i2c) {
++		nc_i2c = ml_io_map(0x13680000u, 0x1000);
++	}
++	if (!pins) {
++		pins = ml_io_map(0x136d0000u, 0x1000);
++	}
++	if (!nc_i2c || !pins) {
++		return;
++	}
++	uint32_t con = notefe_rd(pins, 0x40);
++	if (((con >> 16) & 0xf) != 2 || ((con >> 20) & 0xf) != 2) {
++		notefe_pin(pins, 0x40, 4, 2, -1, -1);   /* gpd1-4/5: HSI2C9, the S2MPB02's bus */
++		notefe_pin(pins, 0x40, 5, 2, -1, -1);
++		nc_bus_init();
++	}
++	uint8_t ctrl = 0, cur = 0, time = 0;
++	if (!nc_read(0x59, 0x12, &ctrl, 1) || !nc_read(0x59, 0x14, &cur, 1) || !nc_read(0x59, 0x15, &time, 1)) {
++		nc_bus_init();
++		printf("NOTEFE TORCH: the S2MPB02 does not answer\n");
++		return;
++	}
++	bool ok;
++	unsigned step = 0;
++	if (thousandths == 0) {
++		ok = nc_pmic_write(0x12, (uint8_t)(ctrl & ~0xc0u));
++	} else {
++		step = 1 + (MIN(thousandths, 1000u) - 1) * 10 / 1000;     /* 1..10 */
++		ok = nc_pmic_write(0x14, (uint8_t)((cur & 0xf0) | step)) && nc_pmic_write(0x15, (uint8_t)((time & 0xf0) | 0x0f)) &&
++		    nc_pmic_write(0x12, (uint8_t)(((ctrl & ~0x08u) & ~0xc0u) | 0xc0u));
++	}
++	uint8_t now = 0;
++	nc_read(0x59, 0x12, &now, 1);
++	static unsigned logged;
++	if (logged++ < 40) {
++		printf("NOTEFE TORCH: %u of 1000 -> %s (%u x 20 mA), FLED_CTRL1 %#x -> %#x%s\n", thousandths, step ? "on" : "off",
++		    step, ctrl, now, ok ? "" : " FAILED");
++	}
++}
++
++static int
++nc_torch_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++static int
++nc_torch_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused proc_t p)
++{
++	return 0;
++}
++
++static int
++nc_torch_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	while (uio_resid(uio) >= (user_ssize_t)sizeof(uint32_t)) {
++		uint32_t thousandths = 0;
++		int error = uiomove((caddr_t)&thousandths, sizeof(thousandths), uio);
++		if (error) {
++			return error;
++		}
++		nc_torch_set(thousandths);
++	}
++	return 0;
++}
++
++static const struct cdevsw nc_torch_cdevsw = {
++	.d_open = nc_torch_open, .d_close = nc_torch_close, .d_read = eno_rdwrt, .d_write = nc_torch_write,
++	.d_ioctl = eno_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static void
++nc_torch_make(void)
++{
++	static bool made;
++	if (made) {
++		return;
++	}
++	int major = cdevsw_add(-1, &nc_torch_cdevsw);
++	if (major < 0 || devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-torch") == NULL) {
++		printf("NOTEFE TORCH: no /dev/hakios-torch\n");
++		return;
++	}
++	made = true;
++	printf("NOTEFE TORCH: /dev/hakios-torch made (major %d)\n", major);
++}
++
+ static int
+ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
