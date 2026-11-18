@@ -1,0 +1,173 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1994,8 +1994,8 @@
+ 	if (level == 7) {
+ 		nc_dev_make();
+ 	}
+-	if (level == 9 || level == 10) {
+-		notefe_cam_rear_id(pins, level);        /* 0346; 10: + the Companion's firmware (0349) */
++	if (level >= 9 && level <= 11) {
++		notefe_cam_rear_id(pins, level);        /* 0346; 10: + the Companion's firmware (0349); 11: + IMX260 stream (0352) */
+ 	}
+ }
+ 
+@@ -2356,15 +2356,15 @@
+ 	return ok;
+ }
+ 
+-/* the drop zone's copy of the firmware; NULL if absent. *len gets its size. Free with kfree_data(p, NC_COMP_FW_MAX). */
++/* a drop zone file, whole; NULL if absent. *len gets its size. Free with kfree_data(p, NC_COMP_FW_MAX). (0352: any) */
+ static uint8_t *
+-nc_comp_fw_read(uint32_t *len)
++nc_drop_read(const char *path, uint32_t *len)
+ {
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	vnode_t vp = NULLVP;
+ 	*len = 0;
+-	if (vnode_open(NC_COMP_FW, FREAD, 0, 0, &vp, ctx) != 0) {
+-		printf("NOTEFE CAM: rear: no %s in the drop zone\n", NC_COMP_FW);
++	if (vnode_open(path, FREAD, 0, 0, &vp, ctx) != 0) {
++		printf("NOTEFE CAM: rear: no %s in the drop zone\n", path);
+ 		return NULL;
+ 	}
+ 	uint8_t *buf = kalloc_data(NC_COMP_FW_MAX, Z_WAITOK | Z_ZERO);
+@@ -2374,6 +2374,14 @@
+ 		*len = NC_COMP_FW_MAX - (uint32_t)resid;      /* a short read: the whole file (it must be under 512 KiB) */
+ 	}
+ 	vnode_close(vp, FREAD, ctx);
++	return buf;
++}
++
++/* the drop zone's copy of the Companion's firmware; NULL if absent or not one */
++static uint8_t *
++nc_comp_fw_read(uint32_t *len)
++{
++	uint8_t *buf = nc_drop_read(NC_COMP_FW, len);
+ 	if (buf != NULL && (*len < 1024 || (*len & 1))) {
+ 		printf("NOTEFE CAM: rear: %s: %u bytes, not a firmware\n", NC_COMP_FW, *len);
+ 		kfree_data(buf, NC_COMP_FW_MAX);
+@@ -2484,6 +2492,83 @@
+ 	    (sig == 0x10a0 || sig == 0x10a1) ? "FIRMWARE RUNS" : "firmware does not answer", id, sig);
+ }
+ 
++/*
++ * (0352, S7) does the rear IMX260 stream? Its registers from the drop zone (cam/imx260.tab: "S7T1", u32 count, then
++ * u16 addr, u16 value, u8 width, 3 bytes 0 each; made from the phone's own Samsung ISP firmware, never in this repo:
++ * the global init and the 2016x1512 mode), then mode_select 0x0100 = 1, and the frame counter 0x0005 read every 100 ms:
++ * it counts only while frames go out. Stream off (0x0100 = 0) at the end. The receiver side (Companion, CSIS0) is next.
++ */
++#define NC_IMX          0x1a
++#define NC_IMX_TAB      "/private/var/herolte/cam/imx260.tab"
++
++static bool
++nc_imx_w(uint16_t reg, uint16_t v, unsigned width)
++{
++	nc_start();
++	bool ok = nc_byte_out((uint8_t)(NC_IMX << 1)) && nc_byte_out((uint8_t)(reg >> 8)) && nc_byte_out((uint8_t)reg) &&
++	    (width != 2 || nc_byte_out((uint8_t)(v >> 8))) && nc_byte_out((uint8_t)v);
++	nc_stop();
++	return ok;
++}
++
++static uint8_t
++nc_imx_r8(uint16_t reg)
++{
++	uint8_t v = 0xff;
++	nc_sensor_read(NC_IMX, reg, &v, 1);
++	return v;
++}
++
++static void
++nc_imx_stream_test(void)
++{
++	uint32_t len = 0;
++	uint8_t *tab = nc_drop_read(NC_IMX_TAB, &len);
++	if (tab == NULL) {
++		return;
++	}
++	uint32_t n = len >= 8 ? *(uint32_t *)(void *)(tab + 4) : 0;
++	if (len < 8 || memcmp(tab, "S7T1", 4) != 0 || n == 0 || 8 + 8ull * n > len) {
++		printf("NOTEFE CAM: rear: %s: not a table (%u bytes)\n", NC_IMX_TAB, len);
++		kfree_data(tab, NC_COMP_FW_MAX);
++		return;
++	}
++	uint8_t id[2] = { 0, 0 };
++	nc_sensor_read(NC_IMX, 0x0016, id, 2);
++	uint64_t t0 = mach_absolute_time();
++	uint32_t failed = 0;
++	for (uint32_t i = 0; i < n; i++) {
++		const uint8_t *e = tab + 8 + 8 * i;
++		uint16_t reg = (uint16_t)(e[0] | e[1] << 8), v = (uint16_t)(e[2] | e[3] << 8);
++		unsigned width = e[4];
++		if (!nc_imx_w(reg, v, width) && !nc_imx_w(reg, v, width)) {
++			if (failed++ < 8) {
++				printf("NOTEFE CAM: rear: IMX260 write %#06x = %#x (w%u) failed\n", reg, v, width);
++			}
++		}
++	}
++	kfree_data(tab, NC_COMP_FW_MAX);
++	uint64_t ns = 0;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
++	printf("NOTEFE CAM: rear: IMX260 (model %#06x): %u registers written, %u failed, %llu ms; W %u H %u FLL %u LLP %u\n",
++	    id[0] << 8 | id[1], n, failed, ns / 1000000ull, nc_imx_r8(0x034c) << 8 | nc_imx_r8(0x034d),
++	    nc_imx_r8(0x034e) << 8 | nc_imx_r8(0x034f), nc_imx_r8(0x0340) << 8 | nc_imx_r8(0x0341),
++	    nc_imx_r8(0x0342) << 8 | nc_imx_r8(0x0343));
++	uint8_t before = nc_imx_r8(0x0005);
++	bool on = nc_imx_w(0x0100, 0x01, 1);
++	char counts[96];
++	int o = 0;
++	for (unsigned k = 0; k < 8; k++) {
++		delay(100000);
++		o += snprintf(counts + o, sizeof(counts) - (size_t)o, " %u", nc_imx_r8(0x0005));
++	}
++	uint8_t mode = nc_imx_r8(0x0100);
++	nc_imx_w(0x0100, 0x00, 1);
++	delay(50000);
++	printf("NOTEFE CAM: rear: IMX260 stream on %s (0x0100 = %#x); frame count before %u, every 100 ms:%s; stream off\n",
++	    on ? "written" : "NOT written", mode, before, counts);
++}
++
+ struct nc_rail { const char *name; uint8_t reg; uint8_t code; bool fine; unsigned min_mv, max_mv; unsigned wait_us; };
+ 
+ static unsigned
+@@ -2501,6 +2586,7 @@
+ 		{ "VDDAF_2.8V_CAM (LDO12)",      0x29, 0x58, false, 2800, 2800, 2000 },
+ 		{ "VDDA_2.9V_CAM (LDO11) step",  0x28, 0x18, false, 1000, 2950,    0 },
+ 		{ "VDDA_2.9V_CAM (LDO11)",       0x28, 0x5b, false, 1000, 2950,    0 },
++		{ "VDDA_1.8V_CAM (LDO10)",       0x27, 0x33, false, 1875, 1875,    0 },   /* 0352: the IMX260's, its order */
+ 		{ "VDDD_1.2V_CAM (LDO3)",        0x20, 0x24, true,  1000, 1200,    0 },
+ 		{ "VDDIO_1.8V_CAM (LDO7)",       0x24, 0x30, false, 1800, 1800,    0 },
+ 		{ "VDDA_1.8V_COMP (LDO9)",       0x26, 0x30, false, 1800, 1800,    0 },
+@@ -2603,7 +2689,7 @@
+ 	delay(1000);
+ 	printf("NOTEFE CAM: rear: ISP I2C0 idle: gpc2 dat %#x (SDA gpc2-0 %u, SCL gpc2-1 %u)\n", notefe_rd(pins, 0x144),
+ 	    notefe_rd(pins, 0x144) & 1, (notefe_rd(pins, 0x144) >> 1) & 1);
+-	for (unsigned order = 0; order < (level == 10 ? 1u : 2u); order++) {     /* 0349: 10 knows the order (0346) */
++	for (unsigned order = 0; order < (level >= 10 ? 1u : 2u); order++) {     /* 0349: 10, 11 know the order (0346) */
+ 		NC_SDA = order ? 1 : 0;
+ 		NC_SCL = order ? 0 : 1;
+ 		nc_scan("the rear camera's bus (ISP I2C0)");
+@@ -2622,9 +2708,12 @@
+ 			}
+ 		}
+ 	}
+-	if (level == 10) {
++	if (level == 10 || level == 11) {
+ 		nc_comp_firmware();                     /* 0349 */
+ 	}
++	if (level == 11) {
++		nc_imx_stream_test();                   /* 0352 */
++	}
+ 	/* down again, the reverse; everything back as found */
+ 	nc_pin(pins, 0x120, 0, 1, 0, 0);            /* sen_rst low */
+ 	nc_pin(pins, 0x120, 2, 1, 0, 0);            /* prep_rst low */
+@@ -3565,7 +3654,7 @@
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || (value > 7 && value != 9 && value != 10)) {     /* 0346: 9 rear probe; 0349: 10 + Companion firmware */
++	if (value < 1 || value == 8 || value > 11) {     /* 0352: 11 = + IMX260 stream test */     /* 0346: 9 rear probe; 0349: 10 + Companion firmware */
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
