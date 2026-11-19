@@ -1,0 +1,291 @@
+diff --git a/bsd/dev/herolte_battery.c b/bsd/dev/herolte_battery.c
+--- a/bsd/dev/herolte_battery.c
++++ b/bsd/dev/herolte_battery.c
+@@ -374,6 +374,19 @@
+ 	return 0;
+ }
+ 
++/* (0357, S7) the current now and averaged by the gauge (CURRENT 0x0a, AVGCURRENT 0x0b), mA, minus = from the battery */
++int
++herolte_fg_currents(int *now_ma, int *avg_ma)
++{
++	uint16_t c, a;
++	if (!fg_i2c || !fg_word(FG_CURRENT, &c) || !fg_word(0x0b, &a)) {
++		return -1;
++	}
++	*now_ma = (int)(((int64_t)(int16_t)c * 15625) / 100000);
++	*avg_ma = (int)(((int64_t)(int16_t)a * 15625) / 100000);
++	return 0;
++}
++
+ /*
+  * (0339) The vibration motor, for iOS. As on the Galaxy S9 (Scion's hakios.max77705.c, APSL, whose rules this follows):
+  * the MAX77854's haptic block (the MFD's PMIC, 0x66 on this bus) drives the motor and its strength is the duty of a PWM
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1922,6 +1922,7 @@
+ static void notefe_cam_rear_id(vm_offset_t pins, int level);
+ static void nc_torch_make(void);
+ static void herolte_shub_probe(void);
++static void herolte_sleep_census_start(void);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1997,6 +1998,7 @@
+ 		nc_dev_make();
+ 		nc_torch_make();                /* 0353: the flashlight */
+ 		herolte_shub_probe();           /* 0356: the sensor hub, read only, once */
++		herolte_sleep_census_start();   /* 0357: what draws with the screen off */
+ 	}
+ 	if (level >= 9 && level <= 12) {
+ 		notefe_cam_rear_id(pins, level);        /* 0346; 10: + Companion firmware (0349); 11: + IMX260 stream (0352); 12: + CSIS0 (0355) */
+@@ -3959,11 +3961,38 @@
+ 	printf("HEROLTE SHUB: as found: GPS_PWR_EN %u (gpb1 con %#x), MCU_REQ %u (gpe6 con %#x), MCU_RESP %u, HOST_REQ %u, "
+ 	    "gpe2 con %#x dat %#x\n", pwr, b1_con, (e6_dat >> 4) & 1, e6_con, (notefe_rd(p, 0x144) >> 2) & 1,
+ 	    (notefe_rd(alive, 0x64) >> 4) & 1, e2_con, e2_dat);
++	/*
++	 * 0357: boot-0356 read MCU_RESP 0 throughout, but gpg0-2 was never made an input: the stock DTB's ssp-mcu-resp is
++	 * function 0 (input) with pull-up (pud 3; 4-bit PUD fields, exynos5433 bank type). Set so here (put back at the
++	 * end). The chip is then taken out of standby from a clean low (20 ms), and HOST_REQ and MCU_RESP are watched every
++	 * ms for 300 ms: an edge = the ROM is alive.
++	 */
++	uint32_t g0_con = notefe_rd(p, 0x140), g0_pud = notefe_rd(p, 0x148);
++	notefe_wr(p, 0x148, (g0_pud & ~(0xfu << 8)) | (0x3u << 8));
++	shub_pin(p, 0x140, 2, 0, -1);
++	delay(1000);
++	printf("HEROLTE SHUB: MCU_RESP gpg0-2 as found con %#x pud %#x; as input with pull-up now: %u\n", g0_con, g0_pud,
++	    (notefe_rd(p, 0x144) >> 2) & 1);
+ 	bool powered_now = false;
+ 	if (!pwr || !pwr_out) {
++		shub_pin(b, 0xa0, 1, 1, 0);
++		delay(20000);
+ 		shub_pin(b, 0xa0, 1, 1, 1);
+ 		powered_now = true;
+-		delay(100000);
++		unsigned last = 0xff, edges = 0;
++		char ev[160];
++		int o = 0;
++		ev[0] = 0;
++		for (unsigned ms = 0; ms < 300; ms++) {
++			unsigned now = ((notefe_rd(alive, 0x64) >> 4) & 1) | (((notefe_rd(p, 0x144) >> 2) & 1) << 1);
++			if (now != last && edges < 12) {
++				o += snprintf(ev + o, sizeof(ev) - (size_t)o, " %ums:H%u/R%u", ms, now & 1, now >> 1);
++				edges++;
++				last = now;
++			}
++			delay(1000);
++		}
++		printf("HEROLTE SHUB: out of standby, HOST_REQ/MCU_RESP over 300 ms:%s\n", ev);
+ 	}
+ 	/* bcm4773_hello */
+ 	shub_pin(p, 0x40, 4, 1, 1);
+@@ -4014,9 +4043,128 @@
+ 	notefe_wr(p, 0x40, e6_con);
+ 	notefe_wr(b, 0xa4, b1_dat);
+ 	notefe_wr(b, 0xa0, b1_con);
++	notefe_wr(p, 0x140, g0_con);
++	notefe_wr(p, 0x148, g0_pud);
+ 	printf("HEROLTE SHUB: pins and power as found\n");
+ }
+ 
++/*
++ * (0357, S7) Where the power goes with the screen off. boot-0356: 61% to 0 in an hour, the gauge at -600 to -830 mA
++ * the whole time with every process near 0% (TOP all 20-30% of 800%) and the SoC at 32 C. Once per screen-off
++ * episode (30 s after it went off, four per boot): the gauge's current (now/average) 6 times 2 s apart, the ten
++ * power domains' STATUS (PMU 0x105C0000 + pd + 4, 0xf = on; BOOT DTB pd-* nodes), the S2MPS16's registers 0x10-0x7f
++ * (through the APM; 0x00-0x0f left alone: interrupt registers clear on read), the S2MPB02's 0x0b-0x2f, then the
++ * busiest kernel threads over 5 s (osfmk/kern/task.c) and the current again. Reads only.
++ */
++extern volatile uint64_t herolte_screen_off_at;
++extern int herolte_fg_currents(int *now_ma, int *avg_ma);
++extern bool herolte_apm_pmic_read(uint8_t reg, uint8_t *value);
++extern void herolte_kthread_top(uint32_t ms);
++
++static const struct { const char *name; uint32_t off; } hs_pd[] = {
++	{ "aud", 0x40c0 }, { "cam0", 0x4020 }, { "cam1", 0x40a0 }, { "disp0", 0x4080 }, { "g3d", 0x4060 },
++	{ "isp0", 0x4140 }, { "isp1", 0x4160 }, { "mfc", 0x4180 }, { "mscl", 0x4040 }, { "disp1", 0x41a0 },
++};
++
++static void
++hs_currents(const char *when)
++{
++	char line[160];
++	int o = 0;
++	line[0] = 0;
++	for (unsigned i = 0; i < 6; i++) {
++		int now = 0, avg = 0;
++		if (herolte_fg_currents(&now, &avg) == 0) {
++			o += snprintf(line + o, sizeof(line) - (size_t)o, " %d/%d", now, avg);
++		} else {
++			o += snprintf(line + o, sizeof(line) - (size_t)o, " -");
++		}
++		ns_sleep_ms(2000);
++	}
++	printf("HEROLTE SLEEP: %s: mA now/avg:%s\n", when, line);
++}
++
++static void
++hs_census(vm_offset_t pmu, vm_offset_t pins)
++{
++	char line[200];
++	int o = 0;
++	for (unsigned i = 0; i < sizeof(hs_pd) / sizeof(hs_pd[0]); i++) {
++		o += snprintf(line + o, sizeof(line) - (size_t)o, " %s=%x", hs_pd[i].name, notefe_rd(pmu, hs_pd[i].off + 4) & 0xf);
++	}
++	printf("HEROLTE SLEEP: power domains (f = on):%s\n", line);
++	for (unsigned r = 0x10; r < 0x80; r += 16) {
++		o = 0;
++		for (unsigned k = 0; k < 16; k++) {
++			uint8_t v = 0;
++			if (herolte_apm_pmic_read((uint8_t)(r + k), &v)) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " %02x", v);
++			} else {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " --");
++			}
++		}
++		printf("HEROLTE SLEEP: S2MPS16 %02x:%s\n", r, line);
++	}
++	if (nc_i2c) {
++		nc_pins = pins;
++		NC_BANK = 0x140; NC_SDA = 2; NC_SCL = 3;
++		o = 0;
++		for (unsigned r = 0x0b; r <= 0x2f; r++) {
++			uint8_t v = 0;
++			if (nc_read(0x59, (uint8_t)r, &v, 1)) {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " %02x", v);
++			} else {
++				o += snprintf(line + o, sizeof(line) - (size_t)o, " --");
++			}
++		}
++		printf("HEROLTE SLEEP: S2MPB02 0b-2f:%s\n", line);
++	}
++	herolte_kthread_top(5000);
++}
++
++static void
++hs_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	vm_offset_t pmu = ml_io_map(0x105c0000u, 0x5000), pins = ml_io_map(0x136d0000u, 0x1000);
++	uint64_t seen = 0;
++	unsigned rounds = 0;
++	if (!pmu || !pins) {
++		printf("HEROLTE SLEEP: map failed\n");
++		return;
++	}
++	printf("HEROLTE SLEEP: census 30 s into each screen-off (4 per boot)\n");
++	for (;;) {
++		ns_sleep_ms(1000);
++		uint64_t off = herolte_screen_off_at, ns = 0, now = mach_absolute_time();
++		if (off == 0 || off == seen || now < off || rounds >= 4) {
++			continue;
++		}
++		absolutetime_to_nanoseconds(now - off, &ns);
++		if (ns < 30ull * NSEC_PER_SEC) {
++			continue;
++		}
++		seen = off;
++		rounds++;
++		hs_currents("screen off 30 s");
++		hs_census(pmu, pins);
++		hs_currents("after census");
++	}
++}
++
++static void
++herolte_sleep_census_start(void)
++{
++	static bool started;
++	thread_t th;
++	if (started) {
++		return;
++	}
++	started = true;
++	if (kernel_thread_start(hs_thread, NULL, &th) == KERN_SUCCESS) {
++		thread_deallocate(th);
++	}
++}
++
+ static int
+ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -9140,3 +9140,76 @@
+ {
+ 	return kdp_lck_mtx_lock_spin_is_acquired(&task->lock);
+ }
++
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#include <kern/thread_kernel_state.h>
++/*
++ * (0357, S7) Which kernel threads use the CPU: "kernel_task 14%" stayed in every TOP line with the screen off
++ * (boot-0356; 7% on the first boot). Each kernel thread's run time over ms, the busiest six printed with their name,
++ * priority, continuation and the return addresses saved on their stack (three frames), plus this function's own
++ * address to undo the slide. Reads only.
++ */
++#define HKT_MAX 256
++void herolte_kthread_top(uint32_t ms);
++void
++herolte_kthread_top(uint32_t ms)
++{
++	static thread_t th_of[HKT_MAX];
++	static uint64_t t0[HKT_MAX], dt[HKT_MAX];
++	unsigned n = 0, total = 0;
++	thread_t th;
++	task_lock(kernel_task);
++	queue_iterate(&kernel_task->threads, th, thread_t, task_threads) {
++		total++;
++		if (n < HKT_MAX) {
++			thread_reference(th);
++			th_of[n] = th;
++			t0[n] = recount_thread_time_mach(th);
++			n++;
++		}
++	}
++	task_unlock(kernel_task);
++	uint64_t a0 = mach_absolute_time();
++	delay_for_interval(ms, NSEC_PER_MSEC);
++	uint64_t span = mach_absolute_time() - a0, sum = 0;
++	for (unsigned i = 0; i < n; i++) {
++		dt[i] = recount_thread_time_mach(th_of[i]) - t0[i];
++		sum += dt[i];
++	}
++	printf("HEROLTE KTOP: %u kernel threads, %llu%% of one core in all over %u ms (anchor herolte_kthread_top %p)\n",
++	    total, span ? sum * 100 / span : 0, ms, (void *)&herolte_kthread_top);
++	for (unsigned k = 0; k < 6; k++) {
++		unsigned best = HKT_MAX;
++		for (unsigned i = 0; i < n; i++) {
++			if (th_of[i] != THREAD_NULL && (best == HKT_MAX || dt[i] > dt[best])) {
++				best = i;
++			}
++		}
++		if (best == HKT_MAX || dt[best] == 0) {
++			break;
++		}
++		th = th_of[best];
++		char name[MAXTHREADNAMESIZE] = "";
++		thread_get_thread_name(th, name);
++		uint64_t lr[4] = { 0 };
++		if (th->kernel_stack) {
++			vm_offset_t lo = th->kernel_stack, hi = th->kernel_stack + kernel_stack_size;
++			thread_kernel_state_t ks = thread_get_kernel_state(th);
++			uint64_t fp = ks->machine.ss.fp;
++			lr[0] = ks->machine.ss.lr;
++			for (unsigned f = 1; f < 4 && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; f++) {
++				lr[f] = ((uint64_t *)fp)[1];
++				fp = ((uint64_t *)fp)[0];
++			}
++		}
++		printf("HEROLTE KTOP: %llu%% tid %llu '%s' pri %d cont %p lr %#llx %#llx %#llx %#llx\n",
++		    span ? dt[best] * 100 / span : 0, thread_tid(th), name, th->sched_pri, (void *)th->continuation,
++		    lr[0], lr[1], lr[2], lr[3]);
++		dt[best] = 0;
++	}
++	for (unsigned i = 0; i < n; i++) {
++		thread_deallocate(th_of[i]);
++		th_of[i] = THREAD_NULL;
++	}
++}
++#endif
