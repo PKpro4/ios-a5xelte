@@ -212,13 +212,12 @@ diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
 diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
 --- a/osfmk/kern/task.c
 +++ b/osfmk/kern/task.c
-@@ -9140,3 +9140,76 @@
+@@ -9140,3 +9140,75 @@
  {
  	return kdp_lck_mtx_lock_spin_is_acquired(&task->lock);
  }
 +
 +#if defined(ARM64_BOARD_CONFIG_HEROLTE)
-+#include <kern/thread_kernel_state.h>
 +/*
 + * (0357, S7) Which kernel threads use the CPU: "kernel_task 14%" stayed in every TOP line with the screen off
 + * (boot-0356; 7% on the first boot). Each kernel thread's run time over ms, the busiest six printed with their name,
