@@ -1,0 +1,207 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1996,8 +1996,8 @@
+ 		nc_dev_make();
+ 		nc_torch_make();                /* 0353: the flashlight */
+ 	}
+-	if (level >= 9 && level <= 11) {
+-		notefe_cam_rear_id(pins, level);        /* 0346; 10: + the Companion's firmware (0349); 11: + IMX260 stream (0352) */
++	if (level >= 9 && level <= 12) {
++		notefe_cam_rear_id(pins, level);        /* 0346; 10: + Companion firmware (0349); 11: + IMX260 stream (0352); 12: + CSIS0 (0355) */
+ 	}
+ }
+ 
+@@ -2521,6 +2521,22 @@
+ 	return v;
+ }
+ 
++/* 0355 */
++static unsigned
++nc_imx_frames(void)
++{
++	return nc_imx_r8(0x0005);
++}
++
++static bool
++nc_imx_stream(bool on)
++{
++	return nc_imx_w(0x0100, on ? 0x01 : 0x00, 1);
++}
++
++static int nc_rear_level;               /* 0355: the kern.notefe_cam level of the rear's run */
++static void nc_rear_receive(bool (*ws)(bool on));
++
+ static void
+ nc_imx_stream_test(void)
+ {
+@@ -2556,6 +2572,10 @@
+ 	    id[0] << 8 | id[1], n, failed, ns / 1000000ull, nc_imx_r8(0x034c) << 8 | nc_imx_r8(0x034d),
+ 	    nc_imx_r8(0x034e) << 8 | nc_imx_r8(0x034f), nc_imx_r8(0x0340) << 8 | nc_imx_r8(0x0341),
+ 	    nc_imx_r8(0x0342) << 8 | nc_imx_r8(0x0343));
++	if (nc_rear_level == 12) {
++		nc_rear_receive(nc_imx_stream);         /* 0355: the receiver's settle sweep, the stream off after */
++		return;
++	}
+ 	uint8_t before = nc_imx_r8(0x0005);
+ 	bool on = nc_imx_w(0x0100, 0x01, 1);
+ 	char counts[96];
+@@ -2710,11 +2730,12 @@
+ 			}
+ 		}
+ 	}
+-	if (level == 10 || level == 11) {
++	nc_rear_level = level;
++	if (level >= 10) {
+ 		nc_comp_firmware();                     /* 0349 */
+ 	}
+-	if (level == 11) {
+-		nc_imx_stream_test();                   /* 0352 */
++	if (level >= 11) {
++		nc_imx_stream_test();                   /* 0352; 12: + the receiver (0355) */
+ 	}
+ 	/* down again, the reverse; everything back as found */
+ 	nc_pin(pins, 0x120, 0, 1, 0, 0);            /* sen_rst low */
+@@ -3043,6 +3064,133 @@
+ SYSCTL_PROC(_kern, OID_AUTO, notefe_cam_pic, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+     NULL, 0, notefe_cam_pic_sysctl, "S", "Note FE: the front camera's last frame, binned Bayer 8-bit, 8-byte header");
+ 
++/*
++ * (0355, S7) the rear camera's receiver, read and set only while kern.notefe_cam=12 runs: does the IMX260's stream come
++ * through the Companion (73C3, its firmware running, no setfile yet) to CSIS0? The front's path (nc_csis_setup, CSIS2)
++ * at the rear's addresses (stock DTB, Samsung's S5E8890-cmusfr.h): CSIS0 0x14000000, its PHY phy_cam0_csi 0x144F1040
++ * (bit 1 = enable, PMU isolation 0x70c), CMU_CAM0 0x144D0000 (lane byte clock muxes 0x220-0x22c bit 12 = the PHY's
++ * RXBYTECLKHSn, gates 0x848-0x854, CSIS0 ACLK/PCLK gates 0x800/0x804), SysMMU 0x140E0000 (off: physical DMA, as the
++ * front's). 4 lanes (0x0114 = 3), RAW10 (0x2b), 2016 x 1512 into NC_BUF (the front's buffer; the front is not running).
++ * A settle sweep, the sensor stopped around each setup: frames, errors and DMA bytes for each. Everything as found after.
++ */
++#define NC_RW           2016u
++#define NC_RH           1512u
++
++static void
++nc_csis0_setup(vm_offset_t csis, uint32_t settle)
++{
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) & ~1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
++	for (unsigned n = 0; n < 100 && (notefe_rd(csis, 0x4) & 2u); n++) {
++		delay(10);
++	}
++	for (unsigned vc = 0; vc < 4; vc++) {
++		notefe_wr(csis, 0x1000 + vc * 0x100, (notefe_rd(csis, 0x1000 + vc * 0x100) | 1u) & ~2u);
++	}
++	/* DPHY_CMN: settle, 4 data lanes on (bits 4:1); CMN_CTRL lanes field 3 = 4 lanes */
++	notefe_wr(csis, 0x24, (notefe_rd(csis, 0x24) & ~(0xffu << 24) & ~(0xfu << 1)) | ((settle & 0xff) << 24) | (0xfu << 1));
++	notefe_wr(csis, 0x4, (notefe_rd(csis, 0x4) & ~(3u << 8) & ~(1u << 12) & ~(3u << 10)) | (3u << 8));
++	notefe_wr(csis, 0x40, (notefe_rd(csis, 0x40) & ~0x1fffu) | (0x2bu << 2) | (1u << 12));
++	notefe_wr(csis, 0x44, (NC_RH << 16) | NC_RW);
++	notefe_wr(csis, 0x1004, notefe_rd(csis, 0x1004) & ~(3u << 14));
++	for (uint32_t a = 0x1010; a <= 0x102c; a += 4) {
++		notefe_wr(csis, a, NC_BUF);
++	}
++	notefe_wr(csis, 0x1000, (notefe_rd(csis, 0x1000) & ~1u) | 2u);
++	notefe_wr(csis, 0x14, notefe_rd(csis, 0x14));
++	notefe_wr(csis, 0x1c, notefe_rd(csis, 0x1c));
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | (0xfu << 16));
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) | 1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 1u);
++}
++
++/* called by nc_imx_stream_test with the sensor's registers written and the stream off; ws(on) starts/stops it */
++static void
++nc_rear_receive(bool (*ws)(bool on))
++{
++	static vm_offset_t csis, phy, cam0, mmu, pmu;
++	if (!csis) {
++		csis = ml_io_map(0x14000000u, 0x2000);
++		phy = ml_io_map(0x144f1000u, 0x1000);
++		cam0 = ml_io_map(0x144d0000u, 0x1000);
++		mmu = ml_io_map(0x140e0000u, 0x1000);
++		pmu = ml_io_map(0x105c0000u, 0x1000);
++	}
++	if (!nc_frame) {
++		nc_frame = notefe_physmap(NC_BUF, NC_MAP_LEN);
++	}
++	if (!csis || !phy || !cam0 || !mmu || !pmu || !nc_frame) {
++		printf("NOTEFE CAM: rear rx: map failed\n");
++		return;
++	}
++	uint32_t mmu_ctrl = notefe_rd(mmu, 0), iso = notefe_rd(pmu, 0x70c), phyc = notefe_rd(phy, 0x40);
++	uint32_t aclk = notefe_rd(cam0, 0x800), pclk = notefe_rd(cam0, 0x804), mux[4], gate[4];
++	for (unsigned n = 0; n < 4; n++) {
++		mux[n] = notefe_rd(cam0, 0x220 + 4 * n);
++		gate[n] = notefe_rd(cam0, 0x848 + 4 * n);
++	}
++	printf("NOTEFE CAM: rear rx: as found: CSIS0 version %#x CMN %#x; PHY %#x iso %#x; ACLK %#x PCLK %#x; rx mux %#x %#x %#x %#x "
++	    "gates %#x %#x %#x %#x; SysMMU %#x\n", notefe_rd(csis, 0x0), notefe_rd(csis, 0x4), phyc, iso, aclk, pclk, mux[0], mux[1],
++	    mux[2], mux[3], gate[0], gate[1], gate[2], gate[3], mmu_ctrl);
++	notefe_wr(cam0, 0x800, aclk | 1u);
++	notefe_wr(cam0, 0x804, pclk | 1u);
++	notefe_wr(mmu, 0, 0);
++	notefe_wr(pmu, 0x70c, iso | 1);
++	notefe_wr(phy, 0x40, phyc & ~2u);
++	notefe_wr(phy, 0x40, phyc | 2u);
++	for (unsigned n = 0; n < 4; n++) {
++		notefe_wr(cam0, 0x220 + 4 * n, mux[n] | (1u << 12));
++		notefe_wr(cam0, 0x848 + 4 * n, gate[n] | 1u);
++	}
++	for (uint32_t o = 0; o < NC_RW * NC_RH * 2; o += 4) {
++		*(volatile uint32_t *)(nc_frame + o) = 0xa5a5a5a5u;
++	}
++	static const uint8_t settles[] = { 6, 10, 14, 18, 22, 28, 36 };
++	for (unsigned i = 0; i < sizeof(settles); i++) {
++		ws(false);
++		delay(60000);
++		nc_csis0_setup(csis, settles[i]);
++		ws(true);
++		delay(300000);
++		uint32_t s0 = notefe_rd(csis, 0x14), s1 = notefe_rd(csis, 0x1c);
++		printf("NOTEFE CAM: rear rx settle %u: frames %u; INT_SRC0 %#x (start %u end %u; SOT_HS %u lostFS %u lostFE %u overflow %u "
++		    "wrongcfg %u ECC %u CRC %u ID %u) INT_SRC1 %#x; DMA bytes %u; DPHY %#x; sensor frames %u\n", settles[i],
++		    notefe_rd(csis, 0x100), s0, (s0 >> 24) & 1, (s0 >> 20) & 1, (s0 >> 16) & 1, (s0 >> 12) & 1, (s0 >> 8) & 1,
++		    (s0 >> 4) & 1, (s0 >> 3) & 1, (s0 >> 2) & 1, (s0 >> 1) & 1, s0 & 1, s1, notefe_rd(csis, 0x1040),
++		    notefe_rd(csis, 0x20), nc_imx_frames());
++	}
++	ws(false);
++	delay(60000);
++	uint32_t changed = 0, last = 0;
++	for (uint32_t o = 0; o < NC_RW * NC_RH * 2; o += 4) {
++		if (*(volatile uint32_t *)(nc_frame + o) != 0xa5a5a5a5u) {
++			changed++;
++			last = o;
++		}
++	}
++	volatile uint16_t *mid = (volatile uint16_t *)(nc_frame + (NC_RH / 2) * NC_RW * 2 + NC_RW);
++	printf("NOTEFE CAM: rear rx: buffer: %u of %u words written, the last at +%#x; middle pixels %u %u %u %u %u %u %u %u\n",
++	    changed, NC_RW * NC_RH / 2, last, mid[0] & 0x3ff, mid[1] & 0x3ff, mid[2] & 0x3ff, mid[3] & 0x3ff, mid[4] & 0x3ff,
++	    mid[5] & 0x3ff, mid[6] & 0x3ff, mid[7] & 0x3ff);
++	/* receiver down, as found */
++	notefe_wr(csis, 0x1000, notefe_rd(csis, 0x1000) | 1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) & ~1u);
++	notefe_wr(csis, 0x24, notefe_rd(csis, 0x24) & ~1u);
++	notefe_wr(csis, 0x4, notefe_rd(csis, 0x4) | 2u);
++	for (unsigned n = 0; n < 4; n++) {
++		notefe_wr(cam0, 0x220 + 4 * n, mux[n]);
++		notefe_wr(cam0, 0x848 + 4 * n, gate[n]);
++	}
++	notefe_wr(phy, 0x40, phyc & ~2u);
++	notefe_wr(phy, 0x40, phyc);
++	notefe_wr(pmu, 0x70c, iso);
++	notefe_wr(mmu, 0, mmu_ctrl);
++	notefe_wr(cam0, 0x804, pclk);
++	notefe_wr(cam0, 0x800, aclk);
++	printf("NOTEFE CAM: rear rx: receiver down, as found\n");
++}
++
+ static void
+ notefe_cam_frame(vm_offset_t pins)
+ {
+@@ -3754,7 +3902,7 @@
+ 	if (!kauth_cred_issuser(kauth_cred_get())) {
+ 		return EPERM;
+ 	}
+-	if (value < 1 || value == 8 || value > 11) {     /* 0352: 11 = + IMX260 stream test */     /* 0346: 9 rear probe; 0349: 10 + Companion firmware */
++	if (value < 1 || value == 8 || value > 12) {     /* 0352: 11 = + IMX260 stream test; 0355: 12 = + CSIS0 receiver */     /* 0346: 9 rear probe; 0349: 10 + Companion firmware */
+ 		return EINVAL;
+ 	}
+ 	notefe_cam_last = value;
