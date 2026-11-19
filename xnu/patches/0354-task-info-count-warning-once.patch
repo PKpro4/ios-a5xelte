@@ -1,0 +1,28 @@
+diff --git a/osfmk/kern/task.c b/osfmk/kern/task.c
+--- a/osfmk/kern/task.c
++++ b/osfmk/kern/task.c
+@@ -5413,13 +5413,18 @@
+ 			 * expanded in the future.
+ 			 * Let's make this potential issue visible by
+ 			 * logging about it...
++			 * (0354, S7) only the first 5: mediaserverd asked 733 times
++			 * in one boot (boot-0352), filling the persistent log.
+ 			 */
+-			printf("%s:%d %d[%s] task_info(flavor=%d) possibly invalid "
+-			    "task_info_count=%d > TASK_VM_INFO_COUNT=%d platform %d sdk "
+-			    "%d.%d.%d - please use TASK_VM_INFO_COUNT.\n",
+-			    __FUNCTION__, __LINE__, proc_pid(p), proc_name_address(p),
+-			    flavor, original_task_info_count, TASK_VM_INFO_COUNT,
+-			    platform, (sdk >> 16), ((sdk >> 8) & 0xff), (sdk & 0xff));
++			static unsigned int task_info_count_warned;
++			if (task_info_count_warned++ < 5) {
++				printf("%s:%d %d[%s] task_info(flavor=%d) possibly invalid "
++				    "task_info_count=%d > TASK_VM_INFO_COUNT=%d platform %d sdk "
++				    "%d.%d.%d - please use TASK_VM_INFO_COUNT.\n",
++				    __FUNCTION__, __LINE__, proc_pid(p), proc_name_address(p),
++				    flavor, original_task_info_count, TASK_VM_INFO_COUNT,
++				    platform, (sdk >> 16), ((sdk >> 8) & 0xff), (sdk & 0xff));
++			}
+ 			DTRACE_VM4(suspicious_task_vm_info_count,
+ 			    mach_msg_type_number_t, original_task_info_count,
+ 			    mach_msg_type_number_t, TASK_VM_INFO_COUNT,
