@@ -1,0 +1,151 @@
+diff --git a/bsd/dev/herolte_gl.c b/bsd/dev/herolte_gl.c
+--- a/bsd/dev/herolte_gl.c
++++ b/bsd/dev/herolte_gl.c
+@@ -1921,6 +1921,7 @@
+ static void nc_dev_make(void);
+ static void notefe_cam_rear_id(vm_offset_t pins, int level);
+ static void nc_torch_make(void);
++static void herolte_shub_probe(void);
+ 
+ static void
+ notefe_cam_probe(int level)
+@@ -1995,6 +1996,7 @@
+ 	if (level == 7) {
+ 		nc_dev_make();
+ 		nc_torch_make();                /* 0353: the flashlight */
++		herolte_shub_probe();           /* 0356: the sensor hub, read only, once */
+ 	}
+ 	if (level >= 9 && level <= 12) {
+ 		notefe_cam_rear_id(pins, level);        /* 0346; 10: + Companion firmware (0349); 11: + IMX260 stream (0352); 12: + CSIS0 (0355) */
+@@ -3890,6 +3892,131 @@
+ 	printf("NOTEFE TORCH: /dev/hakios-torch made (major %d)\n", major);
+ }
+ 
++/*
++ * (0356, S7) the sensor hub, read only: the Broadcom BCM4773 (GPS + sensor hub) the stock DTB puts on spi@14d30000
++ * (BCM4773@0, SPI mode 3). Samsung's drivers/sensorhub/brcm/bbdpl/bcm_gps_spi.c: bcm4773_hello() raises MCU_REQ and
++ * waits up to 100 ms for MCU_RESP; an SSI read is the bytes 0x20 0x00 answered by status and length (then status,
++ * length and the data); HOST_REQ high = the chip has something to send; bcm4773_bye() lowers MCU_REQ. Pins (DTB,
++ * pinctrl-exynos.c banks): SPI1 gpe2-4 SCK, -5 CS (cs-gpio), -6 MISO, -7 MOSI (0x14CC0000 + 0xA0), MCU_REQ gpe6-4
++ * (+0x40), MCU_RESP gpg0-2 (+0x140), HOST_REQ gpa3-4 (0x10580000 + 0x60), GPS_PWR_EN (the chip's nSTANDBY,
++ * lhd.conf GpioNStdbyPath) gpb1-1 (0x136D0000 + 0xA0). Bit-banged here (no SPI controller set up), every pin and
++ * the power pin put back as found. Run once, with the camera device (kern.notefe_cam=7). No firmware is sent.
++ */
++static void
++shub_pin(vm_offset_t base, uint32_t bank, unsigned pin, int out, int level)
++{
++	if (level >= 0) {
++		uint32_t d = notefe_rd(base, bank + 4);
++		notefe_wr(base, bank + 4, level ? (d | (1u << pin)) : (d & ~(1u << pin)));
++	}
++	uint32_t c = notefe_rd(base, bank) & ~(0xfu << (4 * pin));
++	notefe_wr(base, bank, c | ((out ? 1u : 0u) << (4 * pin)));
++}
++
++static uint8_t
++shub_xfer_byte(vm_offset_t p, uint8_t out)
++{
++	uint8_t in = 0;
++	for (int i = 7; i >= 0; i--) {
++		shub_pin(p, 0xa0, 4, 1, 0);                 /* SCK low: the data changes (mode 3) */
++		shub_pin(p, 0xa0, 7, 1, (out >> i) & 1);    /* MOSI */
++		delay(2);
++		shub_pin(p, 0xa0, 4, 1, 1);                 /* SCK high: sampled */
++		delay(2);
++		in = (uint8_t)(in << 1 | ((notefe_rd(p, 0xa4) >> 6) & 1));      /* MISO */
++	}
++	return in;
++}
++
++static void
++shub_xfer(vm_offset_t p, const uint8_t *tx, uint8_t *rx, unsigned n)
++{
++	shub_pin(p, 0xa0, 5, 1, 0);                         /* CS low */
++	delay(5);
++	for (unsigned i = 0; i < n; i++) {
++		rx[i] = shub_xfer_byte(p, tx ? tx[i] : 0);
++	}
++	delay(5);
++	shub_pin(p, 0xa0, 5, 1, 1);                         /* CS high */
++}
++
++static void
++herolte_shub_probe(void)
++{
++	static bool done;
++	if (done) {
++		return;
++	}
++	done = true;
++	vm_offset_t alive = ml_io_map(0x10580000u, 0x1000), p = ml_io_map(0x14cc0000u, 0x1000), b = ml_io_map(0x136d0000u, 0x1000);
++	if (!alive || !p || !b) {
++		printf("HEROLTE SHUB: map failed\n");
++		return;
++	}
++	uint32_t e2_con = notefe_rd(p, 0xa0), e2_dat = notefe_rd(p, 0xa4), e6_con = notefe_rd(p, 0x40), e6_dat = notefe_rd(p, 0x44);
++	uint32_t b1_con = notefe_rd(b, 0xa0), b1_dat = notefe_rd(b, 0xa4);
++	unsigned pwr = (b1_dat >> 1) & 1, pwr_out = ((b1_con >> 4) & 0xf) == 1;
++	printf("HEROLTE SHUB: as found: GPS_PWR_EN %u (gpb1 con %#x), MCU_REQ %u (gpe6 con %#x), MCU_RESP %u, HOST_REQ %u, "
++	    "gpe2 con %#x dat %#x\n", pwr, b1_con, (e6_dat >> 4) & 1, e6_con, (notefe_rd(p, 0x144) >> 2) & 1,
++	    (notefe_rd(alive, 0x64) >> 4) & 1, e2_con, e2_dat);
++	bool powered_now = false;
++	if (!pwr || !pwr_out) {
++		shub_pin(b, 0xa0, 1, 1, 1);
++		powered_now = true;
++		delay(100000);
++	}
++	/* bcm4773_hello */
++	shub_pin(p, 0x40, 4, 1, 1);
++	unsigned waited = 0;
++	bool awake = false;
++	for (unsigned count = 0; count <= 100 && !awake; count++) {
++		awake = (notefe_rd(p, 0x144) >> 2) & 1;
++		if (!awake) {
++			delay(1000);
++			waited++;
++			if (count % 20 == 19 && count < 80) {
++				shub_pin(p, 0x40, 4, 1, 0);
++				delay(1000);
++				shub_pin(p, 0x40, 4, 1, 1);
++				delay(1000);
++			}
++		}
++	}
++	printf("HEROLTE SHUB: hello: MCU_RESP %s after %u ms (power %s); HOST_REQ %u\n", awake ? "HIGH, awake" : "never high",
++	    waited, powered_now ? "switched on now" : "was on", (notefe_rd(alive, 0x64) >> 4) & 1);
++	if (awake) {
++		/* SPI pins as GPIO: SCK and CS high (mode 3 idle), MOSI out, MISO in */
++		shub_pin(p, 0xa0, 5, 1, 1);
++		shub_pin(p, 0xa0, 4, 1, 1);
++		shub_pin(p, 0xa0, 7, 1, 0);
++		shub_pin(p, 0xa0, 6, 0, -1);
++		delay(10);
++		uint8_t tx[34] = { 0x20, 0x00 }, rx[34] = { 0 };
++		shub_xfer(p, tx, rx, 2);
++		printf("HEROLTE SHUB: SSI read: status %#x length %u\n", rx[0], rx[1]);
++		if (rx[0] == 0 && rx[1] > 0 && rx[1] != 0xff) {
++			unsigned n = MIN((unsigned)rx[1], 32u) + 2;
++			memset(rx, 0, sizeof(rx));
++			shub_xfer(p, tx, rx, n);
++			char hex[3 * 34 + 1];
++			int o = 0;
++			for (unsigned i = 0; i < n; i++) {
++				o += snprintf(hex + o, sizeof(hex) - (size_t)o, " %02x", rx[i]);
++			}
++			printf("HEROLTE SHUB: SSI data (%u):%s\n", n, hex);
++		}
++	}
++	/* bcm4773_bye, and everything as found */
++	shub_pin(p, 0x40, 4, 1, 0);
++	notefe_wr(p, 0xa4, e2_dat);
++	notefe_wr(p, 0xa0, e2_con);
++	notefe_wr(p, 0x44, e6_dat);
++	notefe_wr(p, 0x40, e6_con);
++	notefe_wr(b, 0xa4, b1_dat);
++	notefe_wr(b, 0xa0, b1_con);
++	printf("HEROLTE SHUB: pins and power as found\n");
++}
++
+ static int
+ notefe_cam_sysctl SYSCTL_HANDLER_ARGS
+ {
