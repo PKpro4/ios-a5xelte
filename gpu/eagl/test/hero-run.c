@@ -1080,6 +1080,9 @@ devices_start(__unused void *unused)
       mg_cache_set("still-camera", kCFBooleanTrue);
       mg_cache_set("front-facing-camera", kCFBooleanTrue);
       mg_cache_set("rear-facing-camera", kCFBooleanTrue);
+      /* (S7) the flashlight: Control Center's needs MobileGestalt to say there is a flash; the kernel drives the LED
+       * through /dev/hakios-torch (0353), which gpu/camera writes the back camera's TorchLevel to */
+      mg_cache_set("camera-flash", kCFBooleanTrue);
    } else if (cam > 0) {
       herodrm_log("hero-run: devices: camera level %d: %s", cam,
           sysctlbyname("kern.notefe_cam", NULL, NULL, &cam, sizeof(cam)) == 0 ? "set" : "refused");
